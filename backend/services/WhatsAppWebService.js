@@ -1,0 +1,953 @@
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
+const fs = require('fs');
+const path = require('path');
+const WhatsAppAccount = require('../models/WhatsAppAccount');
+const WhatsAppMessage = require('../models/WhatsAppMessage');
+const WhatsAppCampaign = require('../models/WhatsAppCampaign');
+
+class WhatsAppWebService {
+  constructor() {
+    this.clients = new Map();
+    this.qrCodes = new Map();
+    this.sessionPath = path.join(__dirname, '../sessions');
+    
+    // Ensure sessions directory exists
+    if (!fs.existsSync(this.sessionPath)) {
+      fs.mkdirSync(this.sessionPath, { recursive: true });
+    }
+  }
+
+  // Initialize WhatsApp client for a user account
+async initializeClient(accountId, userId) {
+  try {
+    const account = await WhatsAppAccount.findOne({ _id: accountId, user: userId });
+    if (!account) throw new Error('Account not found');
+
+    console.log(`Initializing client for account: ${accountId}`);
+
+    // Check if client already exists and is functional
+    if (this.clients.has(accountId)) {
+      const existingClient = this.clients.get(accountId);
+      console.log(`Existing client found for account: ${accountId}`);
+      
+      // Check if the existing client is ready
+      if (existingClient.info) {
+        console.log(`Existing client is ready for account: ${accountId}`);
+        return existingClient;
+      } else {
+        console.log(`Existing client not ready, cleaning up for account: ${accountId}`);
+        // Clean up the non-ready client
+        try {
+          await existingClient.destroy();
+        } catch (destroyError) {
+          console.warn(`Error destroying existing client: ${destroyError.message}`);
+        }
+        this.clients.delete(accountId);
+        this.qrCodes.delete(accountId);
+      }
+    }
+
+    const client = new Client({
+      authStrategy: new LocalAuth({
+        clientId: accountId,
+        dataPath: this.sessionPath
+      }),
+      puppeteer: {
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--single-process',
+          '--disable-gpu',
+          '--disable-web-security',
+          '--disable-features=VizDisplayCompositor'
+        ]
+      }
+    });
+
+    // Store client IMMEDIATELY after creation
+    this.clients.set(accountId, client);
+    console.log(`Client stored in map for account: ${accountId}`);
+
+    // QR Code generation
+    client.on('qr', async (qr) => {
+      console.log('QR Code generated for account:', accountId);
+      this.qrCodes.set(accountId, qr);
+      
+      // Update account with QR code
+      account.qrCode = qr;
+      account.status = 'connecting';
+      await account.save();
+      
+      // Emit QR code to frontend via WebSocket
+      if (global.io) {
+        global.io.to(`user_${userId}`).emit('qr_code', { 
+          accountId, 
+          qrCode: qr,
+          timestamp: new Date()
+        });
+      }
+    });
+
+    // Loading state
+    client.on('loading_screen', async (percent, message) => {
+      console.log('Loading screen:', percent, message);
+      if (global.io) {
+        global.io.to(`user_${userId}`).emit('whatsapp_loading', { 
+          accountId, 
+          percent, 
+          message 
+        });
+      }
+    });
+
+    // Authentication success
+    client.on('authenticated', async () => {
+      console.log('WhatsApp authenticated for account:', accountId);
+      account.status = 'authenticated';
+      await account.save();
+      
+      if (global.io) {
+        global.io.to(`user_${userId}`).emit('whatsapp_authenticated', { accountId });
+      }
+    });
+
+    // Client ready - CRITICAL: Ensure client stays in the map
+    client.on('ready', async () => {
+      console.log('WhatsApp client ready for account:', accountId);
+      
+      // Double-check client is still in the map
+      if (!this.clients.has(accountId)) {
+        console.warn(`Client missing from map after ready event, re-adding: ${accountId}`);
+        this.clients.set(accountId, client);
+      }
+      
+      account.status = 'ready';
+      account.lastActivity = new Date();
+      
+      // Get phone number and profile info
+      const info = client.info;
+      if (info && info.wid) {
+        account.phoneNumber = info.wid.user;
+      }
+      
+      await account.save();
+      
+      console.log(`Client ready and verified in map for account: ${accountId}, Phone: ${account.phoneNumber}`);
+      
+      if (global.io) {
+        global.io.to(`user_${userId}`).emit('whatsapp_ready', { 
+          accountId, 
+          phoneNumber: account.phoneNumber,
+          profileName: info?.pushname || 'Unknown'
+        });
+      }
+    });
+
+    // Disconnection handling
+    client.on('disconnected', async (reason) => {
+      console.log('WhatsApp disconnected for account:', accountId, 'Reason:', reason);
+      account.status = 'disconnected';
+      await account.save();
+      
+      // Only remove from map after disconnect event
+      this.clients.delete(accountId);
+      this.qrCodes.delete(accountId);
+      
+      if (global.io) {
+        global.io.to(`user_${userId}`).emit('whatsapp_disconnected', { accountId, reason });
+      }
+    });
+
+    // Message acknowledgment
+    client.on('message_ack', async (msg, ack) => {
+      await this.handleMessageAck(msg, ack, accountId);
+    });
+
+    // Authentication failure
+    client.on('auth_failure', async (msg) => {
+      console.log('Authentication failure for account:', accountId, msg);
+      account.status = 'auth_failed';
+      await account.save();
+      
+      if (global.io) {
+        global.io.to(`user_${userId}`).emit('whatsapp_auth_failed', { accountId, message: msg });
+      }
+    });
+
+    console.log(`Starting client initialization for account: ${accountId}`);
+    await client.initialize();
+
+    return client;
+  } catch (error) {
+    console.error('Error initializing WhatsApp client:', error);
+    // Clean up on error
+    if (this.clients.has(accountId)) {
+      const client = this.clients.get(accountId);
+      try {
+        await client.destroy();
+      } catch (destroyError) {
+        console.warn(`Error destroying client on initialization error: ${destroyError.message}`);
+      }
+      this.clients.delete(accountId);
+    }
+    throw error;
+  }
+}
+
+  // Send message with anti-blocking features
+// Enhanced sendMessage method with better client validation
+async sendMessage(accountId, recipient, content, options = {}) {
+  try {
+    console.log(`Attempting to send message for account: ${accountId}`);
+    console.log(`Available clients in map: ${Array.from(this.clients.keys())}`);
+    
+    const client = this.clients.get(accountId);
+    if (!client) {
+      console.error(`WhatsApp client not found for account: ${accountId}`);
+      console.log(`Clients in map: ${Array.from(this.clients.keys())}`);
+      throw new Error('WhatsApp client not found. Please reconnect your WhatsApp account.');
+    }
+
+    console.log(`Client found for account: ${accountId}, checking readiness...`);
+
+    // Check if client is properly initialized and ready
+    if (!client.info) {
+      console.error(`WhatsApp client not ready for account: ${accountId}`);
+      throw new Error('WhatsApp client not ready. Please wait for connection to complete.');
+    }
+
+    console.log(`Client is ready for account: ${accountId}, Phone: ${client.info.wid?.user}`);
+
+    // Validate client state
+    try {
+      const state = await client.getState();
+      console.log(`Client state for account ${accountId}: ${state}`);
+      if (state !== 'CONNECTED') {
+        throw new Error(`WhatsApp client not connected. Current state: ${state}. Please reconnect.`);
+      }
+    } catch (stateError) {
+      console.error(`Error getting client state for account ${accountId}:`, stateError);
+      throw new Error('Unable to verify WhatsApp connection. Please reconnect your account.');
+    }
+
+    const account = await WhatsAppAccount.findById(accountId);
+    if (!account) {
+      throw new Error('WhatsApp account not found in database');
+    }
+
+    // Update account status if client is ready but DB shows otherwise
+    if (account.status !== 'ready') {
+      account.status = 'ready';
+      await account.save();
+    }
+
+    // Reset daily count if needed
+    account.resetDailyCount();
+
+    // Check daily limits
+    if (account.dailyMessageCount >= account.dailyLimit) {
+      throw new Error('Daily message limit reached');
+    }
+
+    // Apply anti-blocking delays
+    if (options.humanTyping && content.text) {
+      await this.simulateTyping(content.text.length);
+    }
+
+    // Apply random delay
+    if (options.randomDelay) {
+      const delay = Math.random() * (options.maxDelay || 5000) + (options.minDelay || 1000);
+      await this.sleep(delay);
+    }
+
+    let message;
+    // Improved phone number formatting
+    let phoneNumber = recipient.replace(/\D/g, '');
+    
+    // Add country code if missing (assuming India +91)
+    if (!phoneNumber.startsWith('91') && phoneNumber.length === 10) {
+      phoneNumber = '91' + phoneNumber;
+    }
+    
+    const chatId = `${phoneNumber}@c.us`;
+    console.log(`Sending message to: ${chatId}`);
+
+    // Send different types of messages
+    switch (content.type) {
+      case 'text':
+        if (!content.text || content.text.trim() === '') {
+          throw new Error('Text content cannot be empty');
+        }
+        console.log(`Sending text message: "${content.text}"`);
+        message = await client.sendMessage(chatId, content.text);
+        break;
+        
+      case 'image':
+        if (content.mediaPath && fs.existsSync(content.mediaPath)) {
+          const imageMedia = MessageMedia.fromFilePath(content.mediaPath);
+          message = await client.sendMessage(chatId, imageMedia, { caption: content.caption });
+        } else if (content.mediaUrl) {
+          const imageMedia = await MessageMedia.fromUrl(content.mediaUrl);
+          message = await client.sendMessage(chatId, imageMedia, { caption: content.caption });
+        } else {
+          throw new Error('No valid image source provided');
+        }
+        break;
+        
+      case 'video':
+        if (content.mediaPath && fs.existsSync(content.mediaPath)) {
+          const videoMedia = MessageMedia.fromFilePath(content.mediaPath);
+          message = await client.sendMessage(chatId, videoMedia, { caption: content.caption });
+        } else if (content.mediaUrl) {
+          const videoMedia = await MessageMedia.fromUrl(content.mediaUrl);
+          message = await client.sendMessage(chatId, videoMedia, { caption: content.caption });
+        } else {
+          throw new Error('No valid video source provided');
+        }
+        break;
+        
+      case 'document':
+        if (content.mediaPath && fs.existsSync(content.mediaPath)) {
+          const docMedia = MessageMedia.fromFilePath(content.mediaPath);
+          message = await client.sendMessage(chatId, docMedia, { 
+            sendMediaAsDocument: true,
+            caption: content.caption || content.fileName
+          });
+        } else {
+          throw new Error('No valid document source provided');
+        }
+        break;
+        
+      case 'audio':
+        if (content.mediaPath && fs.existsSync(content.mediaPath)) {
+          const audioMedia = MessageMedia.fromFilePath(content.mediaPath);
+          message = await client.sendMessage(chatId, audioMedia, { sendAudioAsVoice: true });
+        } else {
+          throw new Error('No valid audio source provided');
+        }
+        break;
+        
+      default:
+        throw new Error('Unsupported message type');
+    }
+
+    console.log(`Message sent successfully for account: ${accountId}, Message ID: ${message.id._serialized}`);
+
+    // Update account statistics
+    account.dailyMessageCount += 1;
+    account.lastActivity = new Date();
+    await account.save();
+
+    return {
+      success: true,
+      messageId: message.id._serialized,
+      timestamp: new Date(),
+      chatId: message.to
+    };
+  } catch (error) {
+    console.error('Error sending message:', error);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+logClientStatus() {
+  console.log('=== Client Status Report ===');
+  console.log(`Total clients in map: ${this.clients.size}`);
+  
+  for (const [accountId, client] of this.clients.entries()) {
+    console.log(`Account ${accountId}:`);
+    console.log(`  - Client exists: true`);
+    console.log(`  - Client info: ${client.info ? 'Ready' : 'Not ready'}`);
+    console.log(`  - Phone: ${client.info?.wid?.user || 'Unknown'}`);
+  }
+  console.log('=== End Status Report ===');
+}
+async connectWhatsApp(accountId, userId) {
+  try {
+    console.log(`Connect request for account: ${accountId}`);
+    this.logClientStatus();
+    
+    // Check if already connected and ready
+    if (this.clients.has(accountId)) {
+      const existingClient = this.clients.get(accountId);
+      if (existingClient.info) {
+        console.log(`Account ${accountId} already connected and ready`);
+        return {
+          success: true,
+          message: 'Already connected',
+          qrCode: null
+        };
+      }
+    }
+
+    // Initialize new client
+    const client = await this.initializeClient(accountId, userId);
+    
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Connection timeout'));
+      }, 60000); // 1 minute timeout
+
+      // If client becomes ready during initialization
+      if (client.info) {
+        clearTimeout(timeout);
+        resolve({
+          success: true,
+          message: 'Connected successfully',
+          qrCode: null
+        });
+        return;
+      }
+
+      // Wait for QR or ready event
+      client.once('qr', (qr) => {
+        clearTimeout(timeout);
+        resolve({
+          success: true,
+          message: 'QR code generated',
+          qrCode: qr
+        });
+      });
+
+      client.once('ready', () => {
+        clearTimeout(timeout);
+        resolve({
+          success: true,
+          message: 'Connected successfully',
+          qrCode: null
+        });
+      });
+
+      client.once('auth_failure', (error) => {
+        clearTimeout(timeout);
+        reject(new Error(`Authentication failed: ${error}`));
+      });
+    });
+
+  } catch (error) {
+    console.error('Connect WhatsApp error:', error);
+    throw error;
+  }
+}
+// Enhanced processCampaign method with better error handling
+async processCampaign(campaignId) {
+  try {
+    const campaign = await WhatsAppCampaign.findById(campaignId)
+      .populate('whatsappAccount')
+      .populate('user');
+
+    if (!campaign) throw new Error('Campaign not found');
+
+    console.log(`Starting campaign ${campaignId} with ${campaign.messages.length} messages`);
+
+    campaign.status = 'running';
+    campaign.startedAt = new Date();
+    await campaign.save();
+
+    const accountId = campaign.whatsappAccount._id.toString();
+    const client = this.clients.get(accountId);
+
+    // Enhanced client validation
+    if (!client) {
+      throw new Error(`WhatsApp client not found for account ${accountId}. Please reconnect.`);
+    }
+
+    if (!client.info) {
+      throw new Error(`WhatsApp client not ready for account ${accountId}. Please wait for connection.`);
+    }
+
+    // Verify client state before starting campaign
+    try {
+      const state = await client.getState();
+      if (state !== 'CONNECTED') {
+        throw new Error(`WhatsApp client not connected. State: ${state}`);
+      }
+    } catch (stateError) {
+      throw new Error(`Unable to verify WhatsApp connection: ${stateError.message}`);
+    }
+
+    const { antiBlockSettings = {} } = campaign;
+    
+    // Get pending messages
+    const pendingMessages = campaign.messages.filter(m => m.status === 'pending');
+    const batchSize = antiBlockSettings.maxMessagesPerBatch || 50;
+    
+    let totalSent = 0;
+    let totalFailed = 0;
+
+    console.log(`Processing ${pendingMessages.length} pending messages in batches of ${batchSize}`);
+
+    // Process messages in batches
+    for (let i = 0; i < pendingMessages.length; i += batchSize) {
+      const batch = pendingMessages.slice(i, i + batchSize);
+      console.log(`Processing batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(pendingMessages.length/batchSize)}`);
+      
+      // Process batch
+      for (const [index, message] of batch.entries()) {
+        try {
+          // Check if client is still connected before each message
+          if (!this.clients.has(accountId) || !this.clients.get(accountId).info) {
+            throw new Error('WhatsApp client disconnected during campaign');
+          }
+
+          // Apply content variation if enabled
+          let content = message.content;
+          if (antiBlockSettings.contentVariation) {
+            content = await this.applyContentVariation(content);
+          }
+
+          console.log(`Sending message ${i + index + 1}/${pendingMessages.length} to ${message.recipient.phone}`);
+
+          // Send message with enhanced options
+          const result = await this.sendMessage(
+            accountId,
+            message.recipient.phone,
+            content,
+            {
+              humanTyping: antiBlockSettings.humanTypingDelay,
+              randomDelay: antiBlockSettings.randomDelay,
+              minDelay: antiBlockSettings.messageDelay || 1000,
+              maxDelay: (antiBlockSettings.messageDelay || 1000) * 2
+            }
+          );
+
+          // Create message record
+          const whatsAppMessage = new WhatsAppMessage({
+            user: campaign.user._id,
+            campaign: campaign._id,
+            whatsappAccount: campaign.whatsappAccount._id,
+            recipient: message.recipient,
+            content: content,
+            status: result.success ? 'sent' : 'failed',
+            messageId: result.messageId,
+            sentAt: result.success ? new Date() : undefined,
+            failureReason: result.success ? undefined : result.error
+          });
+
+          await whatsAppMessage.save();
+
+          // Update campaign message status
+          if (result.success) {
+            message.status = 'sent';
+            message.sentAt = new Date();
+            message.messageId = result.messageId;
+            totalSent++;
+            console.log(`✅ Message sent successfully to ${message.recipient.phone}`);
+          } else {
+            message.status = 'failed';
+            message.failureReason = result.error;
+            totalFailed++;
+            console.log(`❌ Message failed to ${message.recipient.phone}: ${result.error}`);
+          }
+
+          // Emit progress update
+          if (global.io) {
+            global.io.to(`user_${campaign.user._id}`).emit('campaign_progress', {
+              campaignId: campaign._id,
+              progress: {
+                total: campaign.messages.length,
+                sent: totalSent,
+                failed: totalFailed,
+                pending: pendingMessages.length - totalSent - totalFailed
+              },
+              messageUpdate: {
+                recipient: message.recipient.phone,
+                status: message.status
+              }
+            });
+          }
+
+          // Add delay between messages to avoid rate limiting
+          if (index < batch.length - 1) {
+            const delay = antiBlockSettings.messageDelay || 2000;
+            const randomDelay = Math.random() * delay;
+            await this.sleep(delay + randomDelay);
+          }
+
+        } catch (error) {
+          console.error(`Error processing message to ${message.recipient.phone}:`, error);
+          message.status = 'failed';
+          message.failureReason = error.message;
+          totalFailed++;
+          
+          // If it's a critical client error, stop the campaign
+          if (error.message.includes('client disconnected') || 
+              error.message.includes('client not found')) {
+            console.log('Critical client error, stopping campaign');
+            break;
+          }
+        }
+      }
+
+      // Save progress after each batch
+      await campaign.save();
+
+      // Batch delay (if not the last batch)
+      if (i + batchSize < pendingMessages.length) {
+        const batchDelay = antiBlockSettings.batchDelay || 300000; // 5 minutes default
+        console.log(`Waiting ${batchDelay/1000} seconds before next batch...`);
+        await this.sleep(batchDelay);
+      }
+    }
+
+    campaign.status = totalFailed === 0 ? 'completed' : 'partial';
+    campaign.completedAt = new Date();
+    await campaign.save();
+
+    console.log(`Campaign ${campaignId} completed. Sent: ${totalSent}, Failed: ${totalFailed}`);
+
+    // Emit completion event
+    if (global.io) {
+      global.io.to(`user_${campaign.user._id}`).emit('campaign_completed', {
+        campaignId: campaign._id,
+        stats: {
+          total: campaign.messages.length,
+          sent: totalSent,
+          failed: totalFailed
+        }
+      });
+    }
+
+    return {
+      success: true,
+      stats: {
+        total: campaign.messages.length,
+        sent: totalSent,
+        failed: totalFailed
+      }
+    };
+
+  } catch (error) {
+    console.error('Error processing campaign:', error);
+    
+    try {
+      await WhatsAppCampaign.findByIdAndUpdate(campaignId, {
+        status: 'failed',
+        error: error.message,
+        completedAt: new Date()
+      });
+    } catch (updateError) {
+      console.error('Error updating failed campaign:', updateError);
+    }
+
+    throw error;
+  }
+}
+
+// Add a method to check client health
+async checkClientHealth(accountId) {
+  try {
+    const client = this.clients.get(accountId);
+    if (!client) {
+      return { healthy: false, status: 'not_found', message: 'Client not found' };
+    }
+
+    if (!client.info) {
+      return { healthy: false, status: 'not_ready', message: 'Client not ready' };
+    }
+
+    const state = await client.getState();
+    if (state !== 'CONNECTED') {
+      return { healthy: false, status: state, message: `Client state: ${state}` };
+    }
+
+    // Try to get client info to ensure it's responsive
+    const info = client.info;
+    return { 
+      healthy: true, 
+      status: 'connected', 
+      message: 'Client healthy',
+      phoneNumber: info.wid?.user,
+      profileName: info.pushname
+    };
+
+  } catch (error) {
+    return { 
+      healthy: false, 
+      status: 'error', 
+      message: error.message 
+    };
+  }
+}
+
+// Enhanced getAccountStatus method
+getAccountStatus(accountId) {
+  const client = this.clients.get(accountId);
+  if (!client) {
+    return { status: 'disconnected', message: 'Client not found' };
+  }
+  
+  if (!client.info) {
+    return { status: 'connecting', message: 'Client initializing' };
+  }
+  
+  return { 
+    status: 'ready', 
+    message: 'Client ready',
+    phoneNumber: client.info.wid?.user,
+    profileName: client.info.pushname
+  };
+}
+
+  // Process campaign with advanced features
+  async processCampaign(campaignId) {
+    try {
+      const campaign = await WhatsAppCampaign.findById(campaignId)
+        .populate('whatsappAccount')
+        .populate('user');
+
+      if (!campaign) throw new Error('Campaign not found');
+
+      campaign.status = 'running';
+      campaign.startedAt = new Date();
+      await campaign.save();
+
+      const { antiBlockSettings } = campaign;
+      const client = this.clients.get(campaign.whatsappAccount._id.toString());
+
+      if (!client) {
+        throw new Error('WhatsApp client not available');
+      }
+
+      // Get pending messages
+      const pendingMessages = campaign.messages.filter(m => m.status === 'pending');
+      const batchSize = antiBlockSettings.maxMessagesPerBatch || 50;
+
+      // Process messages in batches
+      for (let i = 0; i < pendingMessages.length; i += batchSize) {
+        const batch = pendingMessages.slice(i, i + batchSize);
+        
+        // Process batch
+        for (const message of batch) {
+          try {
+            // Apply content variation if enabled
+            let content = message.content;
+            if (antiBlockSettings.contentVariation) {
+              content = await this.applyContentVariation(content);
+            }
+
+            // Send message
+            const result = await this.sendMessage(
+              campaign.whatsappAccount._id,
+              message.recipient.phone,
+              content,
+              {
+                humanTyping: antiBlockSettings.humanTypingDelay,
+                randomDelay: antiBlockSettings.randomDelay,
+                minDelay: antiBlockSettings.messageDelay,
+                maxDelay: antiBlockSettings.messageDelay * 2
+              }
+            );
+
+            // Create message record
+            const whatsAppMessage = new WhatsAppMessage({
+              user: campaign.user._id,
+              campaign: campaign._id,
+              whatsappAccount: campaign.whatsappAccount._id,
+              recipient: message.recipient,
+              content: content,
+              status: result.success ? 'sent' : 'failed',
+              messageId: result.messageId,
+              sentAt: result.success ? new Date() : undefined,
+              failureReason: result.success ? undefined : result.error
+            });
+
+            await whatsAppMessage.save();
+
+            // Update campaign message status
+            if (result.success) {
+              message.status = 'sent';
+              message.sentAt = new Date();
+              message.messageId = result.messageId;
+            } else {
+              message.status = 'failed';
+              message.failureReason = result.error;
+            }
+
+            // Emit progress update
+            if (global.io) {
+              global.io.to(`user_${campaign.user._id}`).emit('campaign_progress', {
+                campaignId: campaign._id,
+                progress: campaign.progress,
+                messageUpdate: {
+                  recipient: message.recipient.phone,
+                  status: message.status
+                }
+              });
+            }
+
+          } catch (error) {
+            console.error('Error processing message:', error);
+            message.status = 'failed';
+            message.failureReason = error.message;
+          }
+        }
+
+        // Save progress
+        await campaign.save();
+
+        // Batch delay
+        if (i + batchSize < pendingMessages.length) {
+          await this.sleep(antiBlockSettings.batchDelay || 300000);
+        }
+      }
+
+      campaign.status = 'completed';
+      campaign.completedAt = new Date();
+      await campaign.save();
+
+      // Emit completion event
+      if (global.io) {
+        global.io.to(`user_${campaign.user._id}`).emit('campaign_completed', {
+          campaignId: campaign._id,
+          stats: campaign.progress
+        });
+      }
+
+    } catch (error) {
+      console.error('Error processing campaign:', error);
+      await WhatsAppCampaign.findByIdAndUpdate(campaignId, {
+        status: 'failed',
+        error: error.message,
+        completedAt: new Date()
+      });
+    }
+  }
+
+  // Handle message acknowledgments
+  async handleMessageAck(msg, ack, accountId) {
+    try {
+      const message = await WhatsAppMessage.findOne({
+        messageId: msg.id._serialized
+      });
+
+      if (message) {
+        switch (ack) {
+          case 1: // Message sent
+            message.status = 'sent';
+            message.sentAt = new Date();
+            break;
+          case 2: // Message delivered
+            message.status = 'delivered';
+            message.deliveredAt = new Date();
+            break;
+          case 3: // Message read
+            message.status = 'read';
+            message.readAt = new Date();
+            message.analytics.timeToRead = message.readAt - message.sentAt;
+            break;
+        }
+        
+        await message.save();
+
+        // Update campaign if exists
+        if (message.campaign) {
+          const campaign = await WhatsAppCampaign.findById(message.campaign);
+          if (campaign) {
+            const campaignMessage = campaign.messages.find(m => m.messageId === msg.id._serialized);
+            if (campaignMessage) {
+              campaignMessage.status = message.status;
+              campaignMessage.deliveredAt = message.deliveredAt;
+              campaignMessage.readAt = message.readAt;
+              await campaign.save();
+            }
+          }
+        }
+
+        // Emit real-time update
+        if (global.io) {
+          global.io.to(`user_${message.user}`).emit('message_status_update', {
+            messageId: message._id,
+            status: message.status,
+            timestamp: new Date()
+          });
+        }
+      }
+    } catch (error) {
+      console.error('Error handling message ack:', error);
+    }
+  }
+
+  // Anti-blocking helper methods
+  async simulateTyping(textLength) {
+    const typingTime = Math.min(textLength * 50, 5000); // Max 5 seconds
+    await this.sleep(typingTime);
+  }
+
+  async applyContentVariation(content) {
+    if (content.type !== 'text') return content;
+    
+    const variations = [
+      (text) => text,
+      (text) => text + ' 😊',
+      (text) => text + '\n\nBest regards!',
+      (text) => 'Hi! ' + text,
+      (text) => text.replace(/\./g, '...'),
+      (text) => text + '\n\nHave a great day!',
+      (text) => 'Hello! ' + text,
+      (text) => text + ' 👍'
+    ];
+    
+    const randomVariation = variations[Math.floor(Math.random() * variations.length)];
+    return {
+      ...content,
+      text: randomVariation(content.text)
+    };
+  }
+
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  // Get QR code for account
+  getQRCode(accountId) {
+    return this.qrCodes.get(accountId);
+  }
+
+  // Disconnect account
+  async disconnectAccount(accountId) {
+    const client = this.clients.get(accountId);
+    if (client) {
+      await client.destroy();
+      this.clients.delete(accountId);
+      this.qrCodes.delete(accountId);
+    }
+
+    // Clean up session files
+    const sessionDir = path.join(this.sessionPath, `session-${accountId}`);
+    if (fs.existsSync(sessionDir)) {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+  }
+
+  // Get account status
+  getAccountStatus(accountId) {
+    const client = this.clients.get(accountId);
+    return client && client.info ? 'ready' : 'disconnected';
+  }
+
+  // Get all connected clients
+  getConnectedAccounts() {
+    const connected = [];
+    for (const [accountId, client] of this.clients.entries()) {
+      if (client.info) {
+        connected.push({
+          accountId,
+          phoneNumber: client.info.wid?.user,
+          profileName: client.info.pushname
+        });
+      }
+    }
+    return connected;
+  }
+}
+
+module.exports = new WhatsAppWebService();
