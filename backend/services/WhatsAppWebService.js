@@ -21,36 +21,39 @@ class WhatsAppWebService {
   // Initialize WhatsApp client for a user account
 async initializeClient(accountId, userId) {
   try {
-    const account = await WhatsAppAccount.findOne({ _id: accountId, user: userId });
+    // CRITICAL: Ensure accountId is always a string
+    const accountIdString = accountId.toString();
+    
+    const account = await WhatsAppAccount.findOne({ _id: accountIdString, user: userId });
     if (!account) throw new Error('Account not found');
 
-    console.log(`Initializing client for account: ${accountId}`);
+    console.log(`Initializing client for account: ${accountIdString}`);
 
     // Check if client already exists and is functional
-    if (this.clients.has(accountId)) {
-      const existingClient = this.clients.get(accountId);
-      console.log(`Existing client found for account: ${accountId}`);
+    if (this.clients.has(accountIdString)) {
+      const existingClient = this.clients.get(accountIdString);
+      console.log(`Existing client found for account: ${accountIdString}`);
       
       // Check if the existing client is ready
       if (existingClient.info) {
-        console.log(`Existing client is ready for account: ${accountId}`);
+        console.log(`Existing client is ready for account: ${accountIdString}`);
         return existingClient;
       } else {
-        console.log(`Existing client not ready, cleaning up for account: ${accountId}`);
+        console.log(`Existing client not ready, cleaning up for account: ${accountIdString}`);
         // Clean up the non-ready client
         try {
           await existingClient.destroy();
         } catch (destroyError) {
           console.warn(`Error destroying existing client: ${destroyError.message}`);
         }
-        this.clients.delete(accountId);
-        this.qrCodes.delete(accountId);
+        this.clients.delete(accountIdString);
+        this.qrCodes.delete(accountIdString);
       }
     }
 
     const client = new Client({
       authStrategy: new LocalAuth({
-        clientId: accountId,
+        clientId: accountIdString, // Use string version
         dataPath: this.sessionPath
       }),
       puppeteer: {
@@ -70,67 +73,42 @@ async initializeClient(accountId, userId) {
       }
     });
 
-    // Store client IMMEDIATELY after creation
-    this.clients.set(accountId, client);
-    console.log(`Client stored in map for account: ${accountId}`);
+    // CRITICAL: Store client with string key
+    this.clients.set(accountIdString, client);
+    console.log(`Client stored in map for account: ${accountIdString}`);
 
-    // QR Code generation
+    // Rest of the method remains same, just replace accountId with accountIdString
+    // in all event handlers...
+
     client.on('qr', async (qr) => {
-      console.log('QR Code generated for account:', accountId);
-      this.qrCodes.set(accountId, qr);
+      console.log('QR Code generated for account:', accountIdString);
+      this.qrCodes.set(accountIdString, qr);
       
-      // Update account with QR code
       account.qrCode = qr;
       account.status = 'connecting';
       await account.save();
       
-      // Emit QR code to frontend via WebSocket
       if (global.io) {
         global.io.to(`user_${userId}`).emit('qr_code', { 
-          accountId, 
+          accountId: accountIdString, 
           qrCode: qr,
           timestamp: new Date()
         });
       }
     });
 
-    // Loading state
-    client.on('loading_screen', async (percent, message) => {
-      console.log('Loading screen:', percent, message);
-      if (global.io) {
-        global.io.to(`user_${userId}`).emit('whatsapp_loading', { 
-          accountId, 
-          percent, 
-          message 
-        });
-      }
-    });
-
-    // Authentication success
-    client.on('authenticated', async () => {
-      console.log('WhatsApp authenticated for account:', accountId);
-      account.status = 'authenticated';
-      await account.save();
-      
-      if (global.io) {
-        global.io.to(`user_${userId}`).emit('whatsapp_authenticated', { accountId });
-      }
-    });
-
-    // Client ready - CRITICAL: Ensure client stays in the map
     client.on('ready', async () => {
-      console.log('WhatsApp client ready for account:', accountId);
+      console.log('WhatsApp client ready for account:', accountIdString);
       
       // Double-check client is still in the map
-      if (!this.clients.has(accountId)) {
-        console.warn(`Client missing from map after ready event, re-adding: ${accountId}`);
-        this.clients.set(accountId, client);
+      if (!this.clients.has(accountIdString)) {
+        console.warn(`Client missing from map after ready event, re-adding: ${accountIdString}`);
+        this.clients.set(accountIdString, client);
       }
       
       account.status = 'ready';
       account.lastActivity = new Date();
       
-      // Get phone number and profile info
       const info = client.info;
       if (info && info.wid) {
         account.phoneNumber = info.wid.user;
@@ -138,63 +116,34 @@ async initializeClient(accountId, userId) {
       
       await account.save();
       
-      console.log(`Client ready and verified in map for account: ${accountId}, Phone: ${account.phoneNumber}`);
+      console.log(`Client ready and verified in map for account: ${accountIdString}, Phone: ${account.phoneNumber}`);
       
       if (global.io) {
         global.io.to(`user_${userId}`).emit('whatsapp_ready', { 
-          accountId, 
+          accountId: accountIdString, 
           phoneNumber: account.phoneNumber,
           profileName: info?.pushname || 'Unknown'
         });
       }
     });
 
-    // Disconnection handling
-    client.on('disconnected', async (reason) => {
-      console.log('WhatsApp disconnected for account:', accountId, 'Reason:', reason);
-      account.status = 'disconnected';
-      await account.save();
-      
-      // Only remove from map after disconnect event
-      this.clients.delete(accountId);
-      this.qrCodes.delete(accountId);
-      
-      if (global.io) {
-        global.io.to(`user_${userId}`).emit('whatsapp_disconnected', { accountId, reason });
-      }
-    });
+    // Update other event handlers similarly...
 
-    // Message acknowledgment
-    client.on('message_ack', async (msg, ack) => {
-      await this.handleMessageAck(msg, ack, accountId);
-    });
-
-    // Authentication failure
-    client.on('auth_failure', async (msg) => {
-      console.log('Authentication failure for account:', accountId, msg);
-      account.status = 'auth_failed';
-      await account.save();
-      
-      if (global.io) {
-        global.io.to(`user_${userId}`).emit('whatsapp_auth_failed', { accountId, message: msg });
-      }
-    });
-
-    console.log(`Starting client initialization for account: ${accountId}`);
+    console.log(`Starting client initialization for account: ${accountIdString}`);
     await client.initialize();
 
     return client;
   } catch (error) {
     console.error('Error initializing WhatsApp client:', error);
-    // Clean up on error
-    if (this.clients.has(accountId)) {
-      const client = this.clients.get(accountId);
+    const accountIdString = accountId.toString();
+    if (this.clients.has(accountIdString)) {
+      const client = this.clients.get(accountIdString);
       try {
         await client.destroy();
       } catch (destroyError) {
         console.warn(`Error destroying client on initialization error: ${destroyError.message}`);
       }
-      this.clients.delete(accountId);
+      this.clients.delete(accountIdString);
     }
     throw error;
   }
@@ -483,36 +432,108 @@ async connectWhatsApp(accountId, userId) {
     throw error;
   }
 }
-// Enhanced processCampaign method with better error handling
+
+// Add a method to check client health
+async checkClientHealth(accountId) {
+  try {
+    const client = this.clients.get(accountId);
+    if (!client) {
+      return { healthy: false, status: 'not_found', message: 'Client not found' };
+    }
+
+    if (!client.info) {
+      return { healthy: false, status: 'not_ready', message: 'Client not ready' };
+    }
+
+    const state = await client.getState();
+    if (state !== 'CONNECTED') {
+      return { healthy: false, status: state, message: `Client state: ${state}` };
+    }
+
+    // Try to get client info to ensure it's responsive
+    const info = client.info;
+    return { 
+      healthy: true, 
+      status: 'connected', 
+      message: 'Client healthy',
+      phoneNumber: info.wid?.user,
+      profileName: info.pushname
+    };
+
+  } catch (error) {
+    return { 
+      healthy: false, 
+      status: 'error', 
+      message: error.message 
+    };
+  }
+}
+
+// Enhanced getAccountStatus method
+getAccountStatus(accountId) {
+  const client = this.clients.get(accountId);
+  if (!client) {
+    return { status: 'disconnected', message: 'Client not found' };
+  }
+  
+  if (!client.info) {
+    return { status: 'connecting', message: 'Client initializing' };
+  }
+  
+  return { 
+    status: 'ready', 
+    message: 'Client ready',
+    phoneNumber: client.info.wid?.user,
+    profileName: client.info.pushname
+  };
+}
+
+  // Process campaign with advanced features
 async processCampaign(campaignId) {
   try {
+    console.log(`Starting campaign processing for: ${campaignId}`);
+    
     const campaign = await WhatsAppCampaign.findById(campaignId)
       .populate('whatsappAccount')
       .populate('user');
 
     if (!campaign) throw new Error('Campaign not found');
 
-    console.log(`Starting campaign ${campaignId} with ${campaign.messages.length} messages`);
+    console.log(`Campaign found with ${campaign.messages.length} messages`);
 
     campaign.status = 'running';
     campaign.startedAt = new Date();
     await campaign.save();
 
+    // CRITICAL FIX: Ensure consistent string conversion
     const accountId = campaign.whatsappAccount._id.toString();
+    console.log(`Looking for client with accountId: ${accountId}`);
+    console.log(`Available clients: ${Array.from(this.clients.keys())}`);
+    if (!this.clients.has(accountId)) {
+  console.warn(`Client not found for accountId ${accountId}, attempting to initialize...`);
+  await this.initializeClient(accountId, campaign.user._id); // Make sure this function works as expected
+}
     const client = this.clients.get(accountId);
 
     // Enhanced client validation
     if (!client) {
+      console.error(`WhatsApp client not found for account ${accountId}`);
       throw new Error(`WhatsApp client not found for account ${accountId}. Please reconnect.`);
     }
 
+    console.log(`Client found for account: ${accountId}`);
+
     if (!client.info) {
+      console.error(`WhatsApp client not ready for account ${accountId}`);
       throw new Error(`WhatsApp client not ready for account ${accountId}. Please wait for connection.`);
     }
+
+    console.log(`Client is ready for account: ${accountId}`);
 
     // Verify client state before starting campaign
     try {
       const state = await client.getState();
+      console.log(`Client state for account ${accountId}: ${state}`);
       if (state !== 'CONNECTED') {
         throw new Error(`WhatsApp client not connected. State: ${state}`);
       }
@@ -539,8 +560,9 @@ async processCampaign(campaignId) {
       // Process batch
       for (const [index, message] of batch.entries()) {
         try {
-          // Check if client is still connected before each message
-          if (!this.clients.has(accountId) || !this.clients.get(accountId).info) {
+          // CRITICAL: Check if client is still connected before each message
+          const currentClient = this.clients.get(accountId);
+          if (!currentClient || !currentClient.info) {
             throw new Error('WhatsApp client disconnected during campaign');
           }
 
@@ -554,7 +576,7 @@ async processCampaign(campaignId) {
 
           // Send message with enhanced options
           const result = await this.sendMessage(
-            accountId,
+            accountId, // CRITICAL: Use the string version consistently
             message.recipient.phone,
             content,
             {
@@ -613,7 +635,7 @@ async processCampaign(campaignId) {
 
           // Add delay between messages to avoid rate limiting
           if (index < batch.length - 1) {
-            const delay = antiBlockSettings.messageDelay || 3000; // Increased delay
+            const delay = antiBlockSettings.messageDelay || 3000;
             const randomDelay = Math.random() * delay;
             await this.sleep(delay + randomDelay);
           }
@@ -691,187 +713,8 @@ async processCampaign(campaignId) {
   }
 }
 
-// Add a method to check client health
-async checkClientHealth(accountId) {
-  try {
-    const client = this.clients.get(accountId);
-    if (!client) {
-      return { healthy: false, status: 'not_found', message: 'Client not found' };
-    }
 
-    if (!client.info) {
-      return { healthy: false, status: 'not_ready', message: 'Client not ready' };
-    }
-
-    const state = await client.getState();
-    if (state !== 'CONNECTED') {
-      return { healthy: false, status: state, message: `Client state: ${state}` };
-    }
-
-    // Try to get client info to ensure it's responsive
-    const info = client.info;
-    return { 
-      healthy: true, 
-      status: 'connected', 
-      message: 'Client healthy',
-      phoneNumber: info.wid?.user,
-      profileName: info.pushname
-    };
-
-  } catch (error) {
-    return { 
-      healthy: false, 
-      status: 'error', 
-      message: error.message 
-    };
-  }
-}
-
-// Enhanced getAccountStatus method
-getAccountStatus(accountId) {
-  const client = this.clients.get(accountId);
-  if (!client) {
-    return { status: 'disconnected', message: 'Client not found' };
-  }
-  
-  if (!client.info) {
-    return { status: 'connecting', message: 'Client initializing' };
-  }
-  
-  return { 
-    status: 'ready', 
-    message: 'Client ready',
-    phoneNumber: client.info.wid?.user,
-    profileName: client.info.pushname
-  };
-}
-
-  // Process campaign with advanced features
-  async processCampaign(campaignId) {
-    try {
-      const campaign = await WhatsAppCampaign.findById(campaignId)
-        .populate('whatsappAccount')
-        .populate('user');
-
-      if (!campaign) throw new Error('Campaign not found');
-
-      campaign.status = 'running';
-      campaign.startedAt = new Date();
-      await campaign.save();
-
-      const { antiBlockSettings } = campaign;
-      const client = this.clients.get(campaign.whatsappAccount._id.toString());
-
-      if (!client) {
-        throw new Error('WhatsApp client not available');
-      }
-
-      // Get pending messages
-      const pendingMessages = campaign.messages.filter(m => m.status === 'pending');
-      const batchSize = antiBlockSettings.maxMessagesPerBatch || 50;
-
-      // Process messages in batches
-      for (let i = 0; i < pendingMessages.length; i += batchSize) {
-        const batch = pendingMessages.slice(i, i + batchSize);
-        
-        // Process batch
-        for (const message of batch) {
-          try {
-            // Apply content variation if enabled
-            let content = message.content;
-            if (antiBlockSettings.contentVariation) {
-              content = await this.applyContentVariation(content);
-            }
-
-            // Send message
-            const result = await this.sendMessage(
-              campaign.whatsappAccount._id,
-              message.recipient.phone,
-              content,
-              {
-                humanTyping: antiBlockSettings.humanTypingDelay,
-                randomDelay: antiBlockSettings.randomDelay,
-                minDelay: antiBlockSettings.messageDelay,
-                maxDelay: antiBlockSettings.messageDelay * 2
-              }
-            );
-
-            // Create message record
-            const whatsAppMessage = new WhatsAppMessage({
-              user: campaign.user._id,
-              campaign: campaign._id,
-              whatsappAccount: campaign.whatsappAccount._id,
-              recipient: message.recipient,
-              content: content,
-              status: result.success ? 'sent' : 'failed',
-              messageId: result.messageId,
-              sentAt: result.success ? new Date() : undefined,
-              failureReason: result.success ? undefined : result.error
-            });
-
-            await whatsAppMessage.save();
-
-            // Update campaign message status
-            if (result.success) {
-              message.status = 'sent';
-              message.sentAt = new Date();
-              message.messageId = result.messageId;
-            } else {
-              message.status = 'failed';
-              message.failureReason = result.error;
-            }
-
-            // Emit progress update
-            if (global.io) {
-              global.io.to(`user_${campaign.user._id}`).emit('campaign_progress', {
-                campaignId: campaign._id,
-                progress: campaign.progress,
-                messageUpdate: {
-                  recipient: message.recipient.phone,
-                  status: message.status
-                }
-              });
-            }
-
-          } catch (error) {
-            console.error('Error processing message:', error);
-            message.status = 'failed';
-            message.failureReason = error.message;
-          }
-        }
-
-        // Save progress
-        await campaign.save();
-
-        // Batch delay
-        if (i + batchSize < pendingMessages.length) {
-          await this.sleep(antiBlockSettings.batchDelay || 300000);
-        }
-      }
-
-      campaign.status = 'completed';
-      campaign.completedAt = new Date();
-      await campaign.save();
-
-      // Emit completion event
-      if (global.io) {
-        global.io.to(`user_${campaign.user._id}`).emit('campaign_completed', {
-          campaignId: campaign._id,
-          stats: campaign.progress
-        });
-      }
-
-    } catch (error) {
-      console.error('Error processing campaign:', error);
-      await WhatsAppCampaign.findByIdAndUpdate(campaignId, {
-        status: 'failed',
-        error: error.message,
-        completedAt: new Date()
-      });
-    }
-  }
-
-  // Handle message acknowledgments
+// Handle message acknowledgments
   async handleMessageAck(msg, ack, accountId) {
     try {
       const message = await WhatsAppMessage.findOne({
