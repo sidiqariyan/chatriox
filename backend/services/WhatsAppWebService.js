@@ -206,6 +206,8 @@ async sendMessage(accountId, recipient, content, options = {}) {
   try {
     console.log(`Attempting to send message for account: ${accountId}`);
     console.log(`Available clients in map: ${Array.from(this.clients.keys())}`);
+    console.log(`Message content:`, content);
+    console.log(`Recipient:`, recipient);
     
     const client = this.clients.get(accountId);
     if (!client) {
@@ -275,8 +277,18 @@ async sendMessage(accountId, recipient, content, options = {}) {
       phoneNumber = '91' + phoneNumber;
     }
     
+    // Ensure phone number is valid
+    if (phoneNumber.length < 10) {
+      throw new Error(`Invalid phone number: ${recipient}. Must be at least 10 digits.`);
+    }
+    
     const chatId = `${phoneNumber}@c.us`;
     console.log(`Sending message to: ${chatId}`);
+    
+    // Validate content before sending
+    if (!content || !content.type) {
+      throw new Error('Message content and type are required');
+    }
 
     // Send different types of messages
     switch (content.type) {
@@ -285,16 +297,34 @@ async sendMessage(accountId, recipient, content, options = {}) {
           throw new Error('Text content cannot be empty');
         }
         console.log(`Sending text message: "${content.text}"`);
-        message = await client.sendMessage(chatId, content.text);
+        try {
+          // Check if number exists on WhatsApp
+          const numberId = await client.getNumberId(chatId);
+          if (!numberId) {
+            throw new Error(`Phone number ${phoneNumber} is not registered on WhatsApp`);
+          }
+          message = await client.sendMessage(chatId, content.text);
+        } catch (sendError) {
+          console.error(`Error sending to ${chatId}:`, sendError);
+          throw new Error(`Failed to send message to ${phoneNumber}: ${sendError.message}`);
+        }
         break;
         
       case 'image':
         if (content.mediaPath && fs.existsSync(content.mediaPath)) {
           const imageMedia = MessageMedia.fromFilePath(content.mediaPath);
-          message = await client.sendMessage(chatId, imageMedia, { caption: content.caption });
+          const numberId = await client.getNumberId(chatId);
+          if (!numberId) {
+            throw new Error(`Phone number ${phoneNumber} is not registered on WhatsApp`);
+          }
+          message = await client.sendMessage(chatId, imageMedia, { caption: content.caption || '' });
         } else if (content.mediaUrl) {
           const imageMedia = await MessageMedia.fromUrl(content.mediaUrl);
-          message = await client.sendMessage(chatId, imageMedia, { caption: content.caption });
+          const numberId = await client.getNumberId(chatId);
+          if (!numberId) {
+            throw new Error(`Phone number ${phoneNumber} is not registered on WhatsApp`);
+          }
+          message = await client.sendMessage(chatId, imageMedia, { caption: content.caption || '' });
         } else {
           throw new Error('No valid image source provided');
         }
@@ -303,10 +333,18 @@ async sendMessage(accountId, recipient, content, options = {}) {
       case 'video':
         if (content.mediaPath && fs.existsSync(content.mediaPath)) {
           const videoMedia = MessageMedia.fromFilePath(content.mediaPath);
-          message = await client.sendMessage(chatId, videoMedia, { caption: content.caption });
+          const numberId = await client.getNumberId(chatId);
+          if (!numberId) {
+            throw new Error(`Phone number ${phoneNumber} is not registered on WhatsApp`);
+          }
+          message = await client.sendMessage(chatId, videoMedia, { caption: content.caption || '' });
         } else if (content.mediaUrl) {
           const videoMedia = await MessageMedia.fromUrl(content.mediaUrl);
-          message = await client.sendMessage(chatId, videoMedia, { caption: content.caption });
+          const numberId = await client.getNumberId(chatId);
+          if (!numberId) {
+            throw new Error(`Phone number ${phoneNumber} is not registered on WhatsApp`);
+          }
+          message = await client.sendMessage(chatId, videoMedia, { caption: content.caption || '' });
         } else {
           throw new Error('No valid video source provided');
         }
@@ -315,6 +353,10 @@ async sendMessage(accountId, recipient, content, options = {}) {
       case 'document':
         if (content.mediaPath && fs.existsSync(content.mediaPath)) {
           const docMedia = MessageMedia.fromFilePath(content.mediaPath);
+          const numberId = await client.getNumberId(chatId);
+          if (!numberId) {
+            throw new Error(`Phone number ${phoneNumber} is not registered on WhatsApp`);
+          }
           message = await client.sendMessage(chatId, docMedia, { 
             sendMediaAsDocument: true,
             caption: content.caption || content.fileName
@@ -327,6 +369,10 @@ async sendMessage(accountId, recipient, content, options = {}) {
       case 'audio':
         if (content.mediaPath && fs.existsSync(content.mediaPath)) {
           const audioMedia = MessageMedia.fromFilePath(content.mediaPath);
+          const numberId = await client.getNumberId(chatId);
+          if (!numberId) {
+            throw new Error(`Phone number ${phoneNumber} is not registered on WhatsApp`);
+          }
           message = await client.sendMessage(chatId, audioMedia, { sendAudioAsVoice: true });
         } else {
           throw new Error('No valid audio source provided');
@@ -351,7 +397,7 @@ async sendMessage(accountId, recipient, content, options = {}) {
       chatId: message.to
     };
   } catch (error) {
-    console.error('Error sending message:', error);
+    console.error(`Error sending message for account ${accountId}:`, error);
     return {
       success: false,
       error: error.message
@@ -567,7 +613,7 @@ async processCampaign(campaignId) {
 
           // Add delay between messages to avoid rate limiting
           if (index < batch.length - 1) {
-            const delay = antiBlockSettings.messageDelay || 2000;
+            const delay = antiBlockSettings.messageDelay || 3000; // Increased delay
             const randomDelay = Math.random() * delay;
             await this.sleep(delay + randomDelay);
           }
@@ -584,6 +630,9 @@ async processCampaign(campaignId) {
             console.log('Critical client error, stopping campaign');
             break;
           }
+          
+          // Add delay after failed message to prevent rate limiting
+          await this.sleep(2000);
         }
       }
 
@@ -592,7 +641,7 @@ async processCampaign(campaignId) {
 
       // Batch delay (if not the last batch)
       if (i + batchSize < pendingMessages.length) {
-        const batchDelay = antiBlockSettings.batchDelay || 300000; // 5 minutes default
+        const batchDelay = antiBlockSettings.batchDelay || 180000; // 3 minutes default
         console.log(`Waiting ${batchDelay/1000} seconds before next batch...`);
         await this.sleep(batchDelay);
       }

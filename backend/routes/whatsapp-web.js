@@ -251,6 +251,52 @@ router.delete('/accounts/:id', auth, async (req, res) => {
   }
 });
 
+// @route   GET /api/whatsapp-web/account-status/:id
+// @desc    Get real-time account status
+// @access  Private
+router.get('/account-status/:id', auth, async (req, res) => {
+  try {
+    const accountId = req.params.id;
+    const userId = req.user.id;
+
+    // Verify account ownership
+    const account = await WhatsAppAccount.findOne({
+      _id: accountId,
+      user: userId
+    });
+
+    if (!account) {
+      return res.status(404).json({
+        success: false,
+        message: 'WhatsApp account not found'
+      });
+    }
+
+    // Get real-time status from service
+    const serviceStatus = WhatsAppWebService.getAccountStatus(accountId);
+    
+    res.json({
+      success: true,
+      data: {
+        accountId,
+        dbStatus: account.status,
+        serviceStatus: serviceStatus.status,
+        phoneNumber: serviceStatus.phoneNumber,
+        profileName: serviceStatus.profileName,
+        lastActivity: account.lastActivity,
+        dailyMessageCount: account.dailyMessageCount,
+        dailyLimit: account.dailyLimit
+      }
+    });
+  } catch (error) {
+    console.error('Get account status error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error'
+    });
+  }
+});
+
 // @route   GET /api/whatsapp-web/campaigns
 // @desc    Get all campaigns for user
 // @access  Private
@@ -609,18 +655,6 @@ router.get('/qr/:id', auth, async (req, res) => {
 // @route   POST /api/whatsapp-web/send
 // @desc    Send WhatsApp message
 // @access  Private
-// @route   POST /api/whatsapp-web/send
-// @desc    Send WhatsApp message
-// @access  Private
-// @route   POST /api/whatsapp-web/send
-// @desc    Send WhatsApp message
-// @access  Private
-// @route   POST /api/whatsapp-web/send
-// @desc    Send WhatsApp message
-// @access  Private
-// @route   POST /api/whatsapp-web/send
-// @desc    Send WhatsApp message
-// @access  Private
 router.post('/send', [
   auth,
   upload.single('media')
@@ -697,13 +731,13 @@ router.post('/send', [
     const account = await WhatsAppAccount.findOne({
       _id: accountId,
       user: userId,
-      status: { $in: ['ready', 'connected'] }
+      status: { $in: ['ready', 'connected', 'authenticated'] }
     });
 
     if (!account) {
       return res.status(404).json({
         success: false,
-        message: 'WhatsApp account not found or not ready'
+        message: 'WhatsApp account not found or not ready. Please ensure your WhatsApp is connected.'
       });
     }
 
@@ -721,14 +755,44 @@ router.post('/send', [
         message: `Media file is required for content type: ${messageContent.type}`
       });
     }
+    
+    // Validate text content for text messages
+    if (messageContent.type === 'text' && (!messageContent.text || messageContent.text.trim() === '')) {
+      return res.status(400).json({
+        success: false,
+        message: 'Text content is required for text messages'
+      });
+    }
+    
+    // Clean and validate phone numbers
+    const validatedRecipients = [];
+    for (const recipient of recipientList) {
+      const phone = typeof recipient === 'string' ? recipient : recipient.phone;
+      if (!phone) {
+        continue; // Skip invalid recipients
+      }
+      
+      // Clean phone number
+      const cleanPhone = phone.replace(/\D/g, '');
+      if (cleanPhone.length >= 10) {
+        validatedRecipients.push(cleanPhone);
+      }
+    }
+    
+    if (validatedRecipients.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid phone numbers found in recipients list'
+      });
+    }
 
     // Create campaign for bulk send
     const campaign = new WhatsAppCampaign({
       user: userId,
       name: `Bulk Send - ${new Date().toLocaleDateString()}`,
       whatsappAccount: accountId,
-      messages: recipientList.map(phone => ({
-        recipient: { phone: typeof phone === 'string' ? phone : phone.phone },
+      messages: validatedRecipients.map(phone => ({
+        recipient: { phone },
         content: messageContent,
         status: 'pending'
       })),
@@ -767,7 +831,7 @@ router.post('/send', [
       message: 'Messages queued for sending',
       data: {
         campaignId: campaign._id,
-        recipientCount: recipientList.length,
+        recipientCount: validatedRecipients.length,
         accountName: account.accountName
       }
     });

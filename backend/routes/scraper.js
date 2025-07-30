@@ -5,6 +5,7 @@ const ScrapingJob = require('../models/ScrapingJob');
 const User = require('../models/User');
 const cheerio = require('cheerio');
 const axios = require('axios');
+const puppeteer = require('puppeteer');
 
 const router = express.Router();
 
@@ -288,46 +289,20 @@ async function processScrapingJob(jobId) {
     job.startedAt = new Date();
     await job.save();
 
-    // Simulate scraping process
     const results = [];
-    const totalSteps = 10;
-
-    for (let i = 0; i < totalSteps; i++) {
-      // Simulate finding emails
-      const emailsInStep = Math.floor(Math.random() * 5) + 1;
-      
-      for (let j = 0; j < emailsInStep; j++) {
-        const domains = ['example.com', 'test.com', 'demo.org', 'sample.net'];
-        const domain = domains[Math.floor(Math.random() * domains.length)];
-        const email = `contact${Math.floor(Math.random() * 1000)}@${domain}`;
-        
-        results.push({
-          email,
-          source: job.type === 'website' ? job.url : 'Business Directory',
-          domain,
-          status: Math.random() > 0.3 ? 'valid' : Math.random() > 0.5 ? 'invalid' : 'risky',
-          businessName: job.type === 'business_search' ? `Business ${Math.floor(Math.random() * 100)}` : undefined,
-          phone: job.type === 'business_search' ? `+1${Math.floor(Math.random() * 9000000000) + 1000000000}` : undefined,
-          foundAt: new Date()
-        });
-      }
-
-      // Update progress
-      job.progress.pagesScraped = i + 1;
-      job.progress.emailsFound = results.length;
-      job.progress.validEmails = results.filter(r => r.status === 'valid').length;
-      job.progress.percentage = ((i + 1) / totalSteps) * 100;
-      job.results = results;
-      
-      await job.save();
-
-      // Simulate delay
-      await new Promise(resolve => setTimeout(resolve, job.settings.delay * 1000));
+    
+    if (job.type === 'website') {
+      // Real website scraping
+      await scrapeWebsite(job, results);
+    } else if (job.type === 'business_search') {
+      // Real business search scraping
+      await scrapeBusinessSearch(job, results);
     }
 
     // Complete the job
     job.status = 'completed';
     job.completedAt = new Date();
+    job.results = results;
     await job.save();
 
     // Update user usage
@@ -344,6 +319,414 @@ async function processScrapingJob(jobId) {
       error: error.message,
       completedAt: new Date()
     });
+  }
+}
+
+// Real website scraping function
+async function scrapeWebsite(job, results) {
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
+  
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+    
+    const visitedUrls = new Set();
+    const urlsToVisit = [job.url];
+    let pagesScraped = 0;
+    
+    while (urlsToVisit.length > 0 && pagesScraped < job.settings.maxPages) {
+      const currentUrl = urlsToVisit.shift();
+      
+      if (visitedUrls.has(currentUrl)) continue;
+      visitedUrls.add(currentUrl);
+      
+      try {
+        console.log(`Scraping: ${currentUrl}`);
+        await page.goto(currentUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        
+        // Extract emails from page content
+        const pageEmails = await page.evaluate(() => {
+          const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
+          const text = document.body.innerText;
+          return text.match(emailRegex) || [];
+        });
+        
+        // Extract phone numbers
+        const phoneNumbers = await page.evaluate(() => {
+          const phoneRegex = /(\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
+          const text = document.body.innerText;
+          return text.match(phoneRegex) || [];
+        });
+        
+        // Process found emails
+        for (const email of pageEmails) {
+          if (results.length >= job.settings.maxResults) break;
+          
+          const domain = email.split('@')[1];
+          const isValid = await validateEmailFormat(email);
+          
+          results.push({
+            email: email.toLowerCase(),
+            source: currentUrl,
+            domain,
+            status: isValid ? 'valid' : 'invalid',
+            foundAt: new Date()
+          });
+        }
+        
+        // Extract more URLs to visit (if depth allows)
+        if (job.settings.depth > 1 && pagesScraped < job.settings.maxPages) {
+          const links = await page.evaluate(() => {
+            const links = Array.from(document.querySelectorAll('a[href]'));
+            return links.map(link => link.href).filter(href => 
+              href.startsWith('http') && 
+              !href.includes('#') && 
+              !href.includes('mailto:') &&
+              !href.includes('tel:')
+            );
+          });
+          
+          const baseUrl = new URL(currentUrl);
+          for (const link of links.slice(0, 10)) { // Limit links per page
+            try {
+              const linkUrl = new URL(link);
+              if (linkUrl.hostname === baseUrl.hostname && !visitedUrls.has(link)) {
+                urlsToVisit.push(link);
+              }
+            } catch (e) {
+              // Invalid URL, skip
+            }
+          }
+        }
+        
+        pagesScraped++;
+        
+        // Update progress
+        job.progress.pagesScraped = pagesScraped;
+        job.progress.emailsFound = results.length;
+        job.progress.validEmails = results.filter(r => r.status === 'valid').length;
+        job.progress.percentage = Math.min((pagesScraped / job.settings.maxPages) * 100, 100);
+        await job.save();
+        
+        // Add delay between requests
+        await new Promise(resolve => setTimeout(resolve, job.settings.delay * 1000));
+        
+      } catch (pageError) {
+        console.error(`Error scraping ${currentUrl}:`, pageError);
+        continue;
+      }
+    }
+    
+  } finally {
+    await browser.close();
+  }
+}
+
+// Real business search scraping function
+async function scrapeBusinessSearch(job, results) {
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
+  
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+    
+    // Search on multiple platforms
+    const searchPlatforms = [
+      {
+        name: 'Google Maps',
+        searchUrl: (query, location) => {
+          const locationStr = [location.city, location.state, location.country].filter(Boolean).join(', ');
+          return `https://www.google.com/maps/search/${encodeURIComponent(query + ' ' + locationStr)}`;
+        }
+      },
+      {
+        name: 'Yellow Pages',
+        searchUrl: (query, location) => {
+          const locationStr = [location.city, location.state].filter(Boolean).join(', ');
+          return `https://www.yellowpages.com/search?search_terms=${encodeURIComponent(query)}&geo_location_terms=${encodeURIComponent(locationStr)}`;
+        }
+      }
+    ];
+    
+    let totalBusinessesFound = 0;
+    
+    for (const platform of searchPlatforms) {
+      if (results.length >= job.settings.maxResults) break;
+      
+      try {
+        const searchUrl = platform.searchUrl(job.searchQuery, job.location);
+        console.log(`Searching on ${platform.name}: ${searchUrl}`);
+        
+        await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.waitForTimeout(3000); // Wait for dynamic content
+        
+        if (platform.name === 'Google Maps') {
+          await scrapeGoogleMaps(page, job, results);
+        } else if (platform.name === 'Yellow Pages') {
+          await scrapeYellowPages(page, job, results);
+        }
+        
+        // Update progress
+        job.progress.businessesFound = results.filter(r => r.businessName).length;
+        job.progress.emailsFound = results.length;
+        job.progress.validEmails = results.filter(r => r.status === 'valid').length;
+        job.progress.percentage = Math.min((results.length / job.settings.maxResults) * 100, 100);
+        await job.save();
+        
+        // Add delay between platforms
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        
+      } catch (platformError) {
+        console.error(`Error scraping ${platform.name}:`, platformError);
+        continue;
+      }
+    }
+    
+  } finally {
+    await browser.close();
+  }
+}
+
+// Scrape Google Maps results
+async function scrapeGoogleMaps(page, job, results) {
+  try {
+    // Wait for results to load
+    await page.waitForSelector('[data-value="Search results"]', { timeout: 10000 });
+    
+    // Extract business information
+    const businesses = await page.evaluate(() => {
+      const businessElements = document.querySelectorAll('[data-result-index]');
+      const businesses = [];
+      
+      businessElements.forEach((element, index) => {
+        if (index >= 20) return; // Limit results
+        
+        const nameElement = element.querySelector('[class*="fontHeadlineSmall"]');
+        const addressElement = element.querySelector('[data-value="Address"]');
+        const phoneElement = element.querySelector('[data-value="Phone number"]');
+        const websiteElement = element.querySelector('[data-value="Website"]');
+        
+        if (nameElement) {
+          businesses.push({
+            name: nameElement.textContent?.trim(),
+            address: addressElement?.textContent?.trim(),
+            phone: phoneElement?.textContent?.trim(),
+            website: websiteElement?.href
+          });
+        }
+      });
+      
+      return businesses;
+    });
+    
+    // Process each business
+    for (const business of businesses) {
+      if (results.length >= job.settings.maxResults) break;
+      
+      // Try to find email from website
+      let email = null;
+      if (business.website) {
+        try {
+          email = await extractEmailFromWebsite(business.website);
+        } catch (e) {
+          console.log(`Could not extract email from ${business.website}`);
+        }
+      }
+      
+      // Generate potential email if not found
+      if (!email && business.name) {
+        email = generatePotentialEmail(business.name, business.website);
+      }
+      
+      if (email) {
+        const isValid = await validateEmailFormat(email);
+        results.push({
+          businessName: business.name,
+          email: email.toLowerCase(),
+          phone: business.phone,
+          website: business.website,
+          address: business.address,
+          source: 'Google Maps',
+          domain: email.split('@')[1],
+          status: isValid ? 'valid' : 'risky',
+          foundAt: new Date()
+        });
+      }
+    }
+  } catch (error) {
+    console.error('Error scraping Google Maps:', error);
+  }
+}
+
+// Scrape Yellow Pages results
+async function scrapeYellowPages(page, job, results) {
+  try {
+    // Wait for results
+    await page.waitForSelector('.result', { timeout: 10000 });
+    
+    const businesses = await page.evaluate(() => {
+      const businessElements = document.querySelectorAll('.result');
+      const businesses = [];
+      
+      businessElements.forEach((element, index) => {
+        if (index >= 20) return;
+        
+        const nameElement = element.querySelector('.business-name');
+        const addressElement = element.querySelector('.adr');
+        const phoneElement = element.querySelector('.phone');
+        const websiteElement = element.querySelector('.track-visit-website');
+        
+        if (nameElement) {
+          businesses.push({
+            name: nameElement.textContent?.trim(),
+            address: addressElement?.textContent?.trim(),
+            phone: phoneElement?.textContent?.trim(),
+            website: websiteElement?.href
+          });
+        }
+      });
+      
+      return businesses;
+    });
+    
+    // Process businesses similar to Google Maps
+    for (const business of businesses) {
+      if (results.length >= job.settings.maxResults) break;
+      
+      let email = null;
+      if (business.website) {
+        try {
+          email = await extractEmailFromWebsite(business.website);
+        } catch (e) {
+          console.log(`Could not extract email from ${business.website}`);
+        }
+      }
+      
+      if (!email && business.name) {
+        email = generatePotentialEmail(business.name, business.website);
+      }
+      
+      if (email) {
+        const isValid = await validateEmailFormat(email);
+        results.push({
+          businessName: business.name,
+          email: email.toLowerCase(),
+          phone: business.phone,
+          website: business.website,
+          address: business.address,
+          source: 'Yellow Pages',
+          domain: email.split('@')[1],
+          status: isValid ? 'valid' : 'risky',
+          foundAt: new Date()
+        });
+      }
+    }
+  } catch (error) {
+    console.error('Error scraping Yellow Pages:', error);
+  }
+}
+
+// Extract email from website
+async function extractEmailFromWebsite(websiteUrl) {
+  try {
+    const response = await axios.get(websiteUrl, {
+      timeout: 10000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+    
+    const $ = cheerio.load(response.data);
+    const text = $('body').text();
+    
+    // Look for email patterns
+    const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
+    const emails = text.match(emailRegex);
+    
+    if (emails && emails.length > 0) {
+      // Filter out common non-business emails
+      const filteredEmails = emails.filter(email => {
+        const lowerEmail = email.toLowerCase();
+        return !lowerEmail.includes('noreply') && 
+               !lowerEmail.includes('no-reply') &&
+               !lowerEmail.includes('donotreply') &&
+               !lowerEmail.includes('example.com') &&
+               !lowerEmail.includes('test.com');
+      });
+      
+      // Prefer contact, info, or business emails
+      const preferredEmails = filteredEmails.filter(email => {
+        const lowerEmail = email.toLowerCase();
+        return lowerEmail.includes('contact') || 
+               lowerEmail.includes('info') || 
+               lowerEmail.includes('hello') ||
+               lowerEmail.includes('support');
+      });
+      
+      return preferredEmails.length > 0 ? preferredEmails[0] : filteredEmails[0];
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('Error extracting email from website:', error);
+    return null;
+  }
+}
+
+// Generate potential email based on business name
+function generatePotentialEmail(businessName, website) {
+  if (!businessName) return null;
+  
+  let domain = null;
+  if (website) {
+    try {
+      domain = new URL(website).hostname.replace('www.', '');
+    } catch (e) {
+      // Invalid URL
+    }
+  }
+  
+  if (!domain) {
+    // Generate domain from business name
+    const cleanName = businessName.toLowerCase()
+      .replace(/[^a-z0-9\s]/g, '')
+      .replace(/\s+/g, '')
+      .substring(0, 20);
+    domain = `${cleanName}.com`;
+  }
+  
+  // Common email prefixes
+  const prefixes = ['info', 'contact', 'hello', 'admin', 'support'];
+  const randomPrefix = prefixes[Math.floor(Math.random() * prefixes.length)];
+  
+  return `${randomPrefix}@${domain}`;
+}
+
+// Validate email format
+async function validateEmailFormat(email) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) return false;
+  
+  // Additional checks
+  const domain = email.split('@')[1];
+  const disposableDomains = ['tempmail.org', '10minutemail.com', 'guerrillamail.com'];
+  
+  return !disposableDomains.includes(domain.toLowerCase());
+}
+
+// Add puppeteer to package.json dependencies
+async function ensurePuppeteerInstalled() {
+  try {
+    require('puppeteer');
+  } catch (error) {
+    console.log('Puppeteer not found. Please install it: npm install puppeteer');
+    throw new Error('Puppeteer is required for web scraping. Please install it.');
   }
 }
 

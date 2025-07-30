@@ -66,6 +66,7 @@ const WhatsAppSender: React.FC = () => {
   const [showAnalytics, setShowAnalytics] = useState(false);
   const [socket, setSocket] = useState<any>(null);
   const [connectionStatus, setConnectionStatus] = useState<{ [key: string]: string }>({});
+  const [sendingProgress, setSendingProgress] = useState<any>(null);
 
   const queryClient = useQueryClient();
 
@@ -99,8 +100,17 @@ const WhatsAppSender: React.FC = () => {
     });
 
     newSocket.on('campaign_progress', (data) => {
+      setSendingProgress(data);
       queryClient.invalidateQueries({ queryKey: ['whatsapp-campaigns'] });
       queryClient.invalidateQueries({ queryKey: ['whatsapp-messages'] });
+    });
+    
+    newSocket.on('campaign_completed', (data) => {
+      setSendingProgress(null);
+      queryClient.invalidateQueries({ queryKey: ['whatsapp-campaigns'] });
+      queryClient.invalidateQueries({ queryKey: ['whatsapp-messages'] });
+      // Show success notification
+      alert(`Campaign completed! Sent: ${data.stats.sent}, Failed: ${data.stats.failed}`);
     });
 
     return () => newSocket.close();
@@ -597,7 +607,13 @@ const WhatsAppSender: React.FC = () => {
               rows={4}
               className="w-full px-4 py-3 border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent"
               placeholder="Type your message here..."
+              required={messageType === 'text'}
             />
+            {messageType === 'text' && (
+              <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+                Message length: {messageContent.length} characters
+              </p>
+            )}
           </div>
 
           {/* Anti-Blocking Settings */}
@@ -609,16 +625,19 @@ const WhatsAppSender: React.FC = () => {
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
               <div className="flex items-center space-x-2">
                 <Zap className="text-blue-600" size={16} />
-                <span className="text-blue-700 dark:text-blue-300">Human-like delays</span>
+                <span className="text-blue-700 dark:text-blue-300">3-5 second delays</span>
               </div>
               <div className="flex items-center space-x-2">
                 <Clock className="text-blue-600" size={16} />
-                <span className="text-blue-700 dark:text-blue-300">Smart timing</span>
+                <span className="text-blue-700 dark:text-blue-300">Number validation</span>
               </div>
               <div className="flex items-center space-x-2">
                 <BarChart3 className="text-blue-600" size={16} />
-                <span className="text-blue-700 dark:text-blue-300">Risk monitoring</span>
+                <span className="text-blue-700 dark:text-blue-300">Batch processing</span>
               </div>
+            </div>
+            <div className="mt-3 text-xs text-blue-600 dark:text-blue-400">
+              ⚠️ Messages are sent with delays to prevent blocking. Large campaigns may take time to complete.
             </div>
           </div>
 
@@ -626,10 +645,20 @@ const WhatsAppSender: React.FC = () => {
           <div className="mt-6 flex items-center justify-between">
             <div className="text-sm text-gray-600 dark:text-gray-400">
               {selectedContacts.length} contact{selectedContacts.length !== 1 ? 's' : ''} selected
+              {selectedContacts.length > 50 && (
+                <span className="block text-yellow-600 dark:text-yellow-400">
+                  Large campaigns will be processed in batches
+                </span>
+              )}
             </div>
             <button
               onClick={handleSendMessage}
-              disabled={!messageContent || selectedContacts.length === 0 || sendMessageMutation.isPending}
+              disabled={
+                (messageType === 'text' && !messageContent.trim()) || 
+                (messageType !== 'text' && !mediaFile) ||
+                selectedContacts.length === 0 || 
+                sendMessageMutation.isPending
+              }
               className="flex items-center space-x-2 px-6 py-3 bg-green-600 text-white rounded-xl hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
               {sendMessageMutation.isPending ? (
@@ -645,6 +674,45 @@ const WhatsAppSender: React.FC = () => {
               )}
             </button>
           </div>
+          
+          {/* Sending Progress */}
+          {sendingProgress && (
+            <div className="mt-6 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-xl p-4">
+              <div className="flex items-center justify-between mb-3">
+                <h4 className="font-semibold text-blue-800 dark:text-blue-400">Sending Progress</h4>
+                <span className="text-sm text-blue-600 dark:text-blue-400">
+                  {sendingProgress.progress.sent + sendingProgress.progress.failed}/{sendingProgress.progress.total}
+                </span>
+              </div>
+              <div className="w-full bg-blue-200 dark:bg-blue-800 rounded-full h-2 mb-3">
+                <div 
+                  className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+                  style={{ 
+                    width: `${((sendingProgress.progress.sent + sendingProgress.progress.failed) / sendingProgress.progress.total) * 100}%` 
+                  }}
+                ></div>
+              </div>
+              <div className="grid grid-cols-3 gap-4 text-sm">
+                <div className="text-center">
+                  <div className="text-lg font-bold text-green-600">{sendingProgress.progress.sent}</div>
+                  <div className="text-gray-600 dark:text-gray-400">Sent</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-lg font-bold text-red-600">{sendingProgress.progress.failed}</div>
+                  <div className="text-gray-600 dark:text-gray-400">Failed</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-lg font-bold text-blue-600">{sendingProgress.progress.pending}</div>
+                  <div className="text-gray-600 dark:text-gray-400">Pending</div>
+                </div>
+              </div>
+              {sendingProgress.messageUpdate && (
+                <div className="mt-3 text-xs text-gray-600 dark:text-gray-400">
+                  Last: {sendingProgress.messageUpdate.recipient} - {sendingProgress.messageUpdate.status}
+                </div>
+              )}
+            </div>
+          )}
         </motion.div>
       )}
 
